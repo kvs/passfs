@@ -1,3 +1,3 @@
 source "http://rubygems.org"
 
-gem "rfuse"
+gem 'rfuse', github: 'kvs/rfuse'

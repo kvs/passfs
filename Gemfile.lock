@@ -1,0 +1,15 @@
+GIT
+  remote: git://github.com/kvs/rfuse.git
+  revision: 438358486481ea498066c46fd04b9c628fa1a65d
+  specs:
+    rfuse (1.0.4.RC0)
+
+GEM
+  remote: http://rubygems.org/
+  specs:
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  rfuse!
