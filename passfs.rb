@@ -8,56 +8,68 @@
 
 require 'pathname'
 require 'rfuse'
+require 'yaml'
+require 'ostruct'
 
 class PassFS
-    HOME  = Pathname('~/.passfs').expand_path
-    STORE = HOME + 'store'
-    MOUNT = HOME + 'mount'
+    attr_reader :config
 
-    def self.mount
-        # noauto_cache
+    def initialize
+        root = Pathname("~/.passfs").expand_path
+        config_file = root + 'config.yml'
+
+        if !config_file.file?
+            puts "* Creating a new config file for you."
+            print "Please enter the GnuPG key to encrypt files for: "
+            keyid = $stdin.readline.chomp
+
+            root.mkdir unless root.directory?
+            config_file.open('w') do |file|
+                file.write <<-EOT.gsub(%r{^\s+}, '').chomp
+                    ---
+                    :store: ~/.passfs/store
+                    :mount: ~/.passfs/mount
+                    :keyid: #{keyid}
+                    :daemonize?: true
+                EOT
+                file.puts
+            end
+        end
+
+        @config = OpenStruct.new(YAML.load_file(config_file))
+        @config.store = Pathname(@config.store).expand_path
+        @config.mount = Pathname(@config.mount).expand_path
+        @config.store.mkdir unless @config.store.directory?
+        @config.mount.mkdir unless @config.mount.directory?
+    end
+
+    def mount
         args = ['-onoubc', '-olocal', '-onobrowse', "-ovolname=#{ENV['USER']}-passfs"]
-        fs = PassFS::FuseFS.new
-        fo = RFuse::FuseDelegator.new(fs, MOUNT, *args)
+        fs = PassFS::FuseFS.new(config)
+        fo = RFuse::FuseDelegator.new(fs, config.mount, *args)
 
         if fo.mounted?
-            #Process.daemon
+            Process.daemon if config.daemonize?
 
-            Signal.trap("TERM") { print "Caught TERM\n" ; fo.exit }
-            Signal.trap("INT") { print "Caught INT\n"; fo.exit }
+            Signal.trap('TERM') { fo.exit }
+            Signal.trap('INT')  { fo.exit }
 
             begin
                 fo.loop
             rescue
-                print "Error:" + $!.to_s
+                puts "Error:" + $!.to_s
             ensure
                 fo.unmount if fo.mounted?
-                print "Unmounted #{ARGV[0]}\n"
+                puts "Unmounted #{config.mount}"
             end
         end
     end
 
-    def self.setup
-        [HOME, STORE, MOUNT].each { |dir| Dir.mkdir(dir) unless Dir.exist?(dir) }
-
-        # FIXME: no. replace with config-file, and set gpg-id there.
-        unless File.exist?(STORE + '.gpg-id')
-            puts "Initializing new password file-store."
-            print "Please enter GPG id: "
-            gpgid = $stdin.readline
-
-            system({"PASSWORD_STORE_DIR" => STORE.to_s}, "pass init #{gpgid}")
-        end
+    def umount
+        system 'umount', config.mount.to_s
     end
 
-    def self.decrypt(file)
-        pipe = IO.popen(%w(gpg2 --quiet --yes --batch --decrypt) + [file.to_s])
-        data = pipe.read
-        pipe.close
-        data
-    end
-
-    def self.add(files)
+    def add(files)
         files.each do |file|
             file = Pathname(file).expand_path
             unless file.to_s.match(/^#{ENV['HOME']}/)
@@ -70,36 +82,63 @@ class PassFS
                 next
             end
 
-            dest = STORE + file.relative_path_from(Pathname(ENV['HOME']))
-            dest.dirname.mkdir unless dest.dirname.exist?
-            system(*%w(gpg2 --encrypt --quiet --yes --batch --recipient), "kvs@binarysolutions.dk", '--output', dest.to_s, file.to_s)
-            # FIXME: add symlink in original files' place
+            relative_path = file.relative_path_from(Pathname(ENV['HOME']))
+            dest = config.store + relative_path
+            dest.dirname.mkpath unless dest.dirname.exist?
+            if system(*%w(gpg2 --encrypt --quiet --yes --batch --recipient), "kvs@binarysolutions.dk", '--output', dest.to_s, file.to_s)
+                File.open("#{dest.to_s}.size", 'w') { |f| f.write file.size }
+                file.rename("#{file.to_s}.old")
+                file.make_symlink(config.mount + relative_path)
+            else
+                $stderr.puts "* Something went wrong"
+                exit 1
+            end
         end
     end
 
     def remove(files)
         files.each do |file|
+            file = Pathname(file).expand_path
+            if file.symlink? && file.readlink.to_s.match(%r{^#{config.mount.to_s}})
+                content = file.read
+                src = file.readlink.to_s.sub(%r{^#{config.mount.to_s}}, config.store.to_s)
+
+                file.unlink
+                file.open('w') { |f| f.write content }
+                File.unlink(src)
+                File.unlink("#{src}.size")
+            else
+                $stderr.puts "Not a file protected by passfs"
+                exit 1
+            end
+
         end
     end
 
     class FuseFS
-        def _stat(path)
-            fstat = path.stat
+        attr_reader :config
 
-            if path.directory?
-                RFuse::Stat.directory(fstat.mode, :uid => fstat.uid, :gid => fstat.gid, :atime => fstat.atime, :mtime => fstat.mtime, :size => fstat.size)
-            else
-                RFuse::Stat.file(fstat.mode, :uid => fstat.uid, :gid => fstat.gid, :atime => fstat.atime, :mtime => fstat.mtime, :size => fstat.size)
-            end
+        def initialize(config)
+            @config = config
+        end
+
+        def _decrypt(file)
+            pipe = IO.popen(%w(gpg2 --quiet --yes --batch --decrypt) + [file.to_s])
+            data = pipe.read
+            pipe.close
+            data
         end
 
         # The new readdir way, c+p-ed from getdir
         def readdir(ctx, path, filler, offset, ffi)
-            path = path.sub(/^\//, '')
+            path = Pathname(path).relative_path_from(Pathname('/'))
+
             begin
-                (STORE + path).entries.each do |entry|
-                    next if entry == Pathname('.') or entry == Pathname('..')
-                    filler.push(entry.to_s, _stat(STORE + path + entry), 0)
+                (config.store + path).entries.each do |entry|
+                    entry = entry.to_s
+
+                    next if entry == '.' or entry == '..' or entry.end_with?('.size')
+                    filler.push(entry, getattr(ctx, path + entry), 0)
                 end
             rescue Errno::ENOTDIR
                 raise Errno::ENOTDIR.new(path)
@@ -107,20 +146,27 @@ class PassFS
         end
 
         def getattr(ctx, path)
-            path = path.sub(/^\//, '')
-            _stat(STORE + path)
+            path = Pathname(path).relative_path_from(Pathname('/')) unless Pathname(path).relative?
+            path = config.store + path
+            fstat = path.stat
+
+            if path.directory?
+                RFuse::Stat.directory(fstat.mode, :uid => fstat.uid, :gid => fstat.gid, :atime => fstat.atime, :mtime => fstat.mtime, :size => fstat.size)
+            else
+                size = Integer(File.read("#{path.to_s}.size"))
+                RFuse::Stat.file(fstat.mode, :uid => fstat.uid, :gid => fstat.gid, :atime => fstat.atime, :mtime => fstat.mtime, :size => size)
+            end
         end
 
         def read(ctx, path, size, offset, fi)
             path = path.sub(/^\//, '')
-            puts "pid #{ctx.pid}, uid #{ctx.uid}, gid #{ctx.gid} reading #{path}"
 
-            store_path = STORE + path
+            store_path = config.store + path
 
             if store_path.directory?
                 raise Errno::EISDIR.new(path)
             elsif store_path.file?
-                content = PassFS.decrypt(store_path)
+                content = _decrypt(store_path)
                 content[offset..offset + size - 1]
             else
                 raise Errno::ENOENT
@@ -148,15 +194,15 @@ end
 
 case ARGV.shift
 when 'mount'
-    PassFS.mount
+    PassFS.new.mount
 when 'umount'
-    PassFS.umount
-when 'add'
-    PassFS.add(ARGV)
-when 'remove'
-    PassFS.remove(ARGV)
+    PassFS.new.umount
+when 'protect'
+    PassFS.new.add(ARGV)
+when 'unprotect'
+    PassFS.new.remove(ARGV)
 when 'setup'
-    PassFS.setup
+    PassFS.new
 else
     $stderr.puts "Unknown command."
     exit 1
