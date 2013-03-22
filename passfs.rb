@@ -87,7 +87,7 @@ class PassFS
             dest.dirname.mkpath unless dest.dirname.exist?
             if system(*%w(gpg2 --encrypt --quiet --yes --batch --recipient), "kvs@binarysolutions.dk", '--output', dest.to_s, file.to_s)
                 File.open("#{dest.to_s}.size", 'w') { |f| f.write file.size }
-                file.rename("#{file.to_s}.old")
+                file.unlink
                 file.make_symlink(config.mount + relative_path)
             else
                 $stderr.puts "* Something went wrong"
