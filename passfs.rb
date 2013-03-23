@@ -85,7 +85,7 @@ class PassFS
             relative_path = file.relative_path_from(Pathname(ENV['HOME']))
             dest = config.store + relative_path
             dest.dirname.mkpath unless dest.dirname.exist?
-            if system(*%w(gpg2 --encrypt --quiet --yes --batch --recipient), "kvs@binarysolutions.dk", '--output', dest.to_s, file.to_s)
+            if system(*%w(gpg2 --encrypt --quiet --yes --batch --recipient), config.keyid, '--output', dest.to_s, file.to_s)
                 File.open("#{dest.to_s}.size", 'w') { |f| f.write file.size }
                 file.unlink
                 file.make_symlink(config.mount + relative_path)
